@@ -7,6 +7,7 @@
 package jkr
 
 import (
+	"bytes"
 	"compress/flate"
 	"fmt"
 	"io"
@@ -15,20 +16,48 @@ import (
 	lua "github.com/yuin/gopher-lua"
 )
 
-// stringPack serializes a lua.LTable into a Lua table literal string
-func stringPack(data *lua.LTable, recursive bool) (string, error) {
+func Marshal(in *lua.LTable) (out []byte, err error) {
+	buf := &bytes.Buffer{}
+	err = MarshalWrite(buf, in)
+	return buf.Bytes(), err
+}
+
+func MarshalWrite(out io.Writer, in *lua.LTable) (err error) {
+	zw, _ := flate.NewWriter(out, flate.BestSpeed)
+	defer zw.Close()
+
+	visited := make(map[*lua.LTable]bool)
+	data, err := stringPack(in, false, visited)
+	if err != nil {
+		return err
+	}
+
+	if _, err := zw.Write([]byte(data)); err != nil {
+		return err
+	}
+
+	return zw.Flush()
+}
+
+// stringPack serializes a lua.LTable into a Lua table literal string with cycle detection
+func stringPack(data *lua.LTable, recursive bool, visited map[*lua.LTable]bool) (string, error) {
+	// Check for cycles
+	if visited[data] {
+		return "", fmt.Errorf("circular reference detected in table")
+	}
+	visited[data] = true
+	defer func() {
+		delete(visited, data)
+	}()
+
 	var b strings.Builder
 	if !recursive {
 		b.WriteString("return ")
 	}
 	b.WriteString("{")
 
-	var firstError error
+	var gerr error
 	data.ForEach(func(key, value lua.LValue) {
-		if firstError != nil {
-			return
-		}
-
 		// serialize key
 		var k string
 		switch key.Type() {
@@ -37,7 +66,7 @@ func stringPack(data *lua.LTable, recursive bool) (string, error) {
 		case lua.LTNumber:
 			k = fmt.Sprintf("[%v]", key)
 		default:
-			firstError = fmt.Errorf("invalid key type: table keys must be strings or numbers")
+			gerr = fmt.Errorf("invalid key type: table keys must be strings or numbers")
 			return
 		}
 		// serialize value
@@ -51,9 +80,9 @@ func stringPack(data *lua.LTable, recursive bool) (string, error) {
 			if fn.Type() == lua.LTFunction {
 				v = "\"MANUAL_REPLACE\""
 			} else {
-				v, err = stringPack(tbl, true)
+				v, err = stringPack(tbl, true, visited)
 				if err != nil {
-					firstError = fmt.Errorf("error packing table value for key %s: %w", k, err)
+					gerr = fmt.Errorf("error packing table value for key %s: %w", k, err)
 					return
 				}
 			}
@@ -68,7 +97,7 @@ func stringPack(data *lua.LTable, recursive bool) (string, error) {
 		case lua.LTNumber:
 			v = fmt.Sprintf("%v", value)
 		default:
-			firstError = fmt.Errorf("unsupported value type %T for key %s", value, k)
+			gerr = fmt.Errorf("unsupported value type %T for key %s", value, k)
 			return
 		}
 		// serialize key-value pair
@@ -77,43 +106,9 @@ func stringPack(data *lua.LTable, recursive bool) (string, error) {
 		b.WriteString(v)
 		b.WriteString(",")
 	})
-	if firstError != nil {
-		return "", firstError
+	if gerr != nil {
+		return "", gerr
 	}
 	b.WriteString("}")
 	return b.String(), nil
-}
-
-// A Writer writes the Lua table in a jkr format.
-//
-// As returned by NewWriter, a Writer writes the Lua table such that it is
-// compatible with the official Balatro program.
-type Writer struct {
-	iw io.Writer
-}
-
-// NewWriter returns a new Writer that writes to w.
-func NewWriter(w io.Writer) *Writer {
-	return &Writer{iw: w}
-}
-
-// Write writes the Lua table to w and then calls Flush on the flate writer,
-// returning any error from the Flush.
-func (w *Writer) Write(in *lua.LTable) error {
-	zw, err := flate.NewWriter(w.iw, flate.BestSpeed)
-	if err != nil {
-		return err
-	}
-	defer zw.Close()
-
-	data, err := stringPack(in, false)
-	if err != nil {
-		return err
-	}
-
-	if _, err := zw.Write([]byte(data)); err != nil {
-		return err
-	}
-
-	return zw.Flush()
 }
